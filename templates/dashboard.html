@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Weather Dashboard</title>
+    <style>
+        body { font-family: Arial; background: #eef; padding: 40px; }
+        .weather-box { background: #fff; padding: 20px; border-radius: 8px; width: 360px; margin: 20px auto; box-shadow: 0 2px 8px #bbb;}
+        .chart-container { background: #fff; padding: 20px; border-radius: 8px; width: 400px; margin: 20px auto; box-shadow: 0 2px 8px #bbb;}
+        input[type="text"], button { padding: 7px; font-size: 16px; }
+        button { margin-left: 5px; cursor: pointer; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px;}
+        th, td { padding: 6px; border: 1px solid #ccc; text-align: center;}
+        th { background: #def;}
+        .alert { color: red; font-weight: bold; }
+        #favoritesBar button { margin: 2px 3px; border-radius:4px; background: #eee; border: 1px solid #bbb; }
+        #favoritesBar { margin-bottom:10px; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <h2>Weather Dashboard</h2>
+    <div>
+        <b>Your Favorite Cities:</b>
+        <div id="favoritesBar"></div>
+        <input type="text" id="city" placeholder="e.g. Delhi, Surat, London" value="Delhi">
+        <button onclick="getWeather()">Show Weather</button>
+        <button onclick="addFavorite()">+ Favorite</button>
+        <button onclick="showTrends()">Show Trends</button>
+        <button onclick="fetchWeatherByGeolocation()" style="background: #cfd8dc;">🌍 Local Weather</button> <!-- GEOLOCATION FEATURE -->
+    </div>
+    <br>
+    <div class="weather-box" id="weather"></div>
+    <div class="chart-container" style="display:none;" id="trendChartBlock">
+        <canvas id="trendChart"></canvas>
+    </div>
+    
+    <script>
+        // Favorites logic
+        function getFavorites() {
+            let favs = localStorage.getItem('weatherFavorites');
+            if(!favs) return [];
+            return favs.split(',');
+        }
+        function setFavorites(arr) {
+            localStorage.setItem('weatherFavorites', arr.join(','));
+        }
+        function displayFavorites() {
+            let favs = getFavorites();
+            let bar = document.getElementById("favoritesBar");
+            if(favs.length === 0) {
+                bar.innerHTML = "<i>No favorites yet.</i>";
+                return;
+            }
+            bar.innerHTML = favs.map(city =>
+                `<button onclick="selectFavorite('${city}')">${city}</button>
+                 <button onclick="removeFavorite('${city}')" style="color:red;">&times;</button>`
+            ).join(" ");
+        }
+        function addFavorite() {
+            let city = document.getElementById("city").value.trim();
+            if(city.length === 0) {
+                alert("Enter a city name first!");
+                return;
+            }
+            let favs = getFavorites();
+            if(!favs.includes(city)) {
+                favs.push(city);
+                setFavorites(favs);
+                displayFavorites();
+            }
+        }
+        function removeFavorite(city) {
+            let favs = getFavorites().filter(c => c !== city);
+            setFavorites(favs);
+            displayFavorites();
+        }
+        function selectFavorite(city) {
+            document.getElementById("city").value = city;
+            getWeather();
+        }
+
+        // GEOLOCATION FUNCTION (NEW)
+        function fetchWeatherByGeolocation() {
+            if (!navigator.geolocation) {
+                alert("Geolocation not supported in your browser.");
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(function(pos) {
+                let lat = pos.coords.latitude;
+                let lon = pos.coords.longitude;
+                // Use WeatherAPI lat,lon as the city arg for backend
+                fetch(`/getalerts/${lat},${lon}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (!data || !data.city) {
+                            document.getElementById("city").value = "";
+                            document.getElementById("weather").innerHTML = "Could not fetch weather for your location.";
+                        } else {
+                            document.getElementById("city").value = data.city;
+                            getWeather();
+                        }
+                    });
+            }, function(err) {
+                alert("Unable to access your location: " + err.message);
+            });
+        }
+
+        function getWeather() {
+            document.getElementById("trendChartBlock").style.display = "none";
+            var city = document.getElementById("city").value.trim();
+            var weatherDiv = document.getElementById("weather");
+            if(city.length === 0) {
+                weatherDiv.innerHTML = "<b>Please enter a city name.</b>";
+                return;
+            }
+            weatherDiv.innerHTML = "Loading...";
+            fetch("/getalerts/" + encodeURIComponent(city))
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        weatherDiv.innerHTML = "<b>Error:</b> " + data.error;
+                    } else {
+                        let html = `
+                            <b>City:</b> ${data.city} <br>
+                            <b>Temperature:</b> ${data.temperature} °C<br>
+                            <b>Condition:</b> ${data.condition}<br>
+                            <b>Last Updated:</b> ${data.lastupdated}<br>
+                        `;
+                        // Show custom logic alerts
+                        if (data.alerts && data.alerts.length > 0) {
+                            html += `<hr><b>Weather Alerts:</b><ul>`;
+                            for(let alert of data.alerts) {
+                                html += `<li class="alert">${alert}</li>`;
+                            }
+                            html += `</ul>`;
+                        }
+                        // Show official severe weather alerts
+                        if (data.official_alerts && data.official_alerts.length > 0) {
+                            html += `<hr><b>Official Severe Weather Alerts:</b><ul style="color:darkred;">`;
+                            for(let oalert of data.official_alerts) {
+                                html += `<li>${oalert}</li>`;
+                            }
+                            html += `</ul>`;
+                        }
+                        html += `<hr>
+                            <b>Forecast (Next 3 Days):</b><br>
+                            <table>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Min (°C)</th>
+                                    <th>Max (°C)</th>
+                                    <th>Condition</th>
+                                </tr>
+                        `;
+                        for(const day of data.forecast) {
+                            html += `
+                                <tr>
+                                    <td>${day.date}</td>
+                                    <td>${day.min}</td>
+                                    <td>${day.max}</td>
+                                    <td>${day.condition}</td>
+                                </tr>
+                            `;
+                        }
+                        html += "</table>";
+                        weatherDiv.innerHTML = html;
+                    }
+                })
+                .catch(err => {
+                    weatherDiv.innerHTML = "Error fetching weather data.";
+                });
+        }
+
+        // Chart.js
+        let trendChart;
+        function showTrends() {
+            var city = document.getElementById("city").value.trim();
+            if(city.length === 0) {
+                alert("Please enter a city name.");
+                return;
+            }
+            fetch("/trends/" + encodeURIComponent(city))
+                .then(res => res.json())
+                .then(trends => {
+                    if(!trends || trends.length === 0) {
+                        alert("No trend data found for " + city);
+                        document.getElementById("trendChartBlock").style.display = "none";
+                        return;
+                    }
+                    document.getElementById("trendChartBlock").style.display = "block";
+                    let labels = trends.map(d => d.date);
+                    let mintemps = trends.map(d => d.mintemp);
+                    let maxtemps = trends.map(d => d.maxtemp);
+
+                    if (trendChart) { trendChart.destroy(); }
+                    var ctx = document.getElementById('trendChart').getContext('2d');
+                    trendChart = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: labels,
+                            datasets: [
+                                {
+                                    label: 'Min Temp (°C)',
+                                    data: mintemps,
+                                    borderColor: '#2196f3',
+                                    backgroundColor: 'rgba(33,150,243,0.1)',
+                                    fill: false
+                                },
+                                {
+                                    label: 'Max Temp (°C)',
+                                    data: maxtemps,
+                                    borderColor: '#f44336',
+                                    backgroundColor: 'rgba(244,67,54,0.1)',
+                                    fill: false
+                                }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            plugins: {
+                                title: {
+                                    display: true,
+                                    text: `Temperature Trends for ${city}`
+                                }
+                            }
+                        }
+                    });
+                })
+                .catch(err => {
+                    alert("Error fetching trend data");
+                    document.getElementById("trendChartBlock").style.display = "none";
+                });
+        }
+
+        window.onload = function() {
+            displayFavorites();
+            getWeather();
+            // You can auto-fetch by location for demo:
+            // fetchWeatherByGeolocation();
+        };
+    </script>
+</body>
+</html>
