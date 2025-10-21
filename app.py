@@ -1,11 +1,12 @@
-from flask import Flask, jsonify, render_template
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify
 import requests, time
 import sqlite3
 from datetime import date
 from config import WEATHER_API_KEY
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-city_cache = {}
+app.secret_key = 'replace_this_with_a_secret_key'
 
 def init_db():
     with sqlite3.connect("weather_history.db") as conn:
@@ -15,10 +16,20 @@ def init_db():
                 record_date TEXT,
                 mintemp REAL,
                 maxtemp REAL,
-                condition TEXT
+                condition TEXT,
+                humidity INTEGER,
+                wind_kph REAL,
+                precip_mm REAL
             )
         ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT, email TEXT, password_hash TEXT
+            );
+        ''')
 init_db()
+city_cache = {}
 
 def fetch_weather(city):
     url = f"http://api.weatherapi.com/v1/forecast.json?key={WEATHER_API_KEY}&q={city}&days=3&alerts=yes"
@@ -27,18 +38,14 @@ def fetch_weather(city):
         data = response.json()
         if 'error' in data:
             return {"error": data['error']['message']}
-        alerts = []
+        alerts, official_alerts = [], []
         for day in data["forecast"]["forecastday"]:
             if day["day"]["maxtemp_c"] > 40:
                 alerts.append(f"Heat Wave Alert on {day['date']}! ({day['day']['maxtemp_c']}°C)")
             if day["day"]["mintemp_c"] < 5:
                 alerts.append(f"Cold Wave Alert on {day['date']}! ({day['day']['mintemp_c']}°C)")
-            condition_lower = day["day"]["condition"]["text"].lower()
-            if "rain" in condition_lower or "thunder" in condition_lower:
+            if "rain" in day["day"]["condition"]["text"].lower() or "thunder" in day["day"]["condition"]["text"].lower():
                 alerts.append(f"Heavy Rain Alert on {day['date']}! ({day['day']['condition']['text']})")
-
-        # Official Alerts (WeatherAPI)
-        official_alerts = []
         if "alerts" in data and "alert" in data["alerts"]:
             for alert in data["alerts"]["alert"]:
                 desc = (
@@ -48,29 +55,35 @@ def fetch_weather(city):
                     f"{alert.get('desc', '')}"
                 )
                 official_alerts.append(desc)
-
-        # Save today's data for trends/history
         try:
             today = str(date.today())
             with sqlite3.connect("weather_history.db") as conn:
-                cur = conn.execute("SELECT 1 FROM weather_history WHERE city=? AND record_date=?",
-                                   (data["location"]["name"], today))
+                cur = conn.execute(
+                    "SELECT 1 FROM weather_history WHERE city=? AND record_date=?",
+                    (data["location"]["name"], today))
                 if cur.fetchone() is None:
                     min_temp = min([d['day']['mintemp_c'] for d in data["forecast"]["forecastday"]])
                     max_temp = max([d['day']['maxtemp_c'] for d in data["forecast"]["forecastday"]])
                     condition = data["current"]["condition"]["text"]
+                    humidity = data["current"]["humidity"]
+                    wind_kph = data["current"]["wind_kph"]
+                    precip_mm = data["current"]["precip_mm"]
                     conn.execute(
-                        "INSERT INTO weather_history (city, record_date, mintemp, maxtemp, condition) VALUES (?, ?, ?, ?, ?)",
-                        (data["location"]["name"], today, min_temp, max_temp, condition)
+                        "INSERT INTO weather_history (city, record_date, mintemp, maxtemp, condition, humidity, wind_kph, precip_mm) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (data["location"]["name"], today, min_temp, max_temp, condition, humidity, wind_kph, precip_mm)
                     )
         except Exception as dberr:
             print("DB save error:", dberr)
-
         weatherinfo = {
             "city": data["location"]["name"],
             "temperature": data["current"]["temp_c"],
             "condition": data["current"]["condition"]["text"],
             "lastupdated": data["current"]["last_updated"],
+            "humidity": data["current"]["humidity"],
+            "wind_kph": data["current"]["wind_kph"],
+            "precip_mm": data["current"]["precip_mm"],
+            "latitude": data["location"]["lat"],
+            "longitude": data["location"]["lon"],
             "forecast": [
                 {
                     "date": day["date"],
@@ -86,6 +99,62 @@ def fetch_weather(city):
         return weatherinfo
     except Exception as e:
         return {"error": str(e)}
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    message = ""
+    if request.method == 'POST':
+        username = request.form['username']
+        email = request.form['email']
+        password = request.form['password']
+        password_hash = generate_password_hash(password)
+        conn = sqlite3.connect('weather_history.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE username=? OR email=?", (username, email))
+        existing = cursor.fetchone()
+        if existing:
+            message = "Username or email already exists!"
+            conn.close()
+        else:
+            cursor.execute(
+                "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+                (username, email, password_hash)
+            )
+            conn.commit()
+            conn.close()
+            return redirect(url_for('login'))
+    return render_template('register.html', message=message)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    message = ""
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        conn = sqlite3.connect('weather_history.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, password_hash FROM users WHERE username=?", (username,))
+        user = cursor.fetchone()
+        conn.close()
+        if user and check_password_hash(user[1], password):
+            session['user_id'] = user[0]
+            session['username'] = username
+            return redirect(url_for('home'))
+        else:
+            message = "Invalid username or password."
+    return render_template('login.html', message=message)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.before_request
+def protect_routes():
+    unauthenticated_routes = ['login', 'register', 'static', None]
+    if not session.get('user_id'):
+        if request.endpoint not in unauthenticated_routes:
+            return redirect(url_for('login'))
 
 @app.route("/", methods=["GET"])
 def home():
@@ -110,11 +179,24 @@ def dashboard():
 def city_trends(city):
     with sqlite3.connect("weather_history.db") as conn:
         rows = conn.execute(
-            "SELECT record_date, mintemp, maxtemp FROM weather_history WHERE city=? ORDER BY record_date DESC LIMIT 7",
+            "SELECT record_date, mintemp, maxtemp, humidity, wind_kph, precip_mm FROM weather_history WHERE city=? ORDER BY record_date DESC LIMIT 7",
             (city.capitalize(),)
         ).fetchall()
-    trends = [{"date": r[0], "mintemp": r[1], "maxtemp": r[2]} for r in rows][::-1]
+    trends = [
+        {"date": r[0], "mintemp": r[1], "maxtemp": r[2], "humidity": r[3], "wind_kph": r[4], "precip_mm": r[5]}
+        for r in rows
+    ][::-1]
     return jsonify(trends)
+
+@app.route("/admin")
+def admin_panel():
+    with sqlite3.connect("weather_history.db") as conn:
+        stats = conn.execute(
+              "SELECT city, COUNT(*) AS records, MAX(maxtemp), MIN(mintemp) FROM weather_history GROUP BY city"
+          ).fetchall()
+        users = conn.execute("SELECT username, email FROM users").fetchall()
+    return render_template("admin.html", stats=stats, users=users)
 
 if __name__ == "__main__":
     app.run(debug=True)
+
